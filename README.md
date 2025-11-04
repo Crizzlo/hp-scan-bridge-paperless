@@ -18,6 +18,7 @@ It starts a small web server. When a `POST` request is sent to `/start_scan`, th
     SCANNER_IP=YOUR_SCANNER_IP
     PAPERLESS_URL=http://YOUR_PAPERLESS_IP_OR_DOMAIN:PORT
     PAPERLESS_TOKEN=YOUR_PAPERLESS_API_TOKEN
+    HOST_PORT=PORT_ON_HOST_FOR_POST_REQUEST
     ```
 
 4.  Start the container:
@@ -47,7 +48,7 @@ Add the following to your `configuration.yaml` file, replacing `YOUR_DOCKER_HOST
 rest_command:
   start_hp_scan:
     url: 'http://YOUR_DOCKER_HOST_IP:5000/start_scan'
-    method: 'POST'
+    method: post
 
 ```
 ### 2. Restart Home Assistant:
