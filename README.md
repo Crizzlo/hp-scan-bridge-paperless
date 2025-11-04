@@ -32,7 +32,7 @@ It starts a small web server. When a `POST` request is sent to `/start_scan`, th
 To start a scan, send a POST request to the server (the default port is 5000):
 
 ```
-curl -X POST http://localhost:5000/start_scan
+curl -X POST http://YOUR_DOCKER_HOST_IP:5000/start_scan
 ```
 
 ## Use Case: Home Assistant Integration
