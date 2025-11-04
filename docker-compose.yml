@@ -1,0 +1,167 @@
+version: '3.8'
+
+services:
+  hp-scan-bridge:
+    image: python:3.11-slim
+    container_name: hp-scan-bridge
+    restart: unless-stopped
+    environment:
+      # Diese Werte werden aus der .env-Datei geladen
+      - SCANNER_IP=${SCANNER_IP}
+      - PAPERLESS_URL=${PAPERLESS_URL}
+      - PAPERLESS_TOKEN=${PAPERLESS_TOKEN}
+      - LOG_LEVEL=INFO
+    command: |
+      sh -c '
+      pip install --no-cache-dir Flask requests && 
+      mkdir -p /app && 
+      cat > /app/scan_bridge.py << "PYEOF"
+      from flask import Flask, jsonify
+      import requests
+      import datetime
+      import time
+      import os
+      import logging
+      from pathlib import Path
+
+      logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s - %(levelname)s - %(message)s")
+      logger = logging.getLogger(__name__)
+      
+      app = Flask(__name__)
+      
+      # Werte aus Umgebungsvariablen lesen
+      SCANNER_IP = os.getenv("SCANNER_IP")
+      PAPERLESS_URL = os.getenv("PAPERLESS_URL")
+      PAPERLESS_TOKEN = os.getenv("PAPERLESS_TOKEN")
+      TEMP_DIR = Path("/tmp/scan_data")
+      
+      if not all([SCANNER_IP, PAPERLESS_URL, PAPERLESS_TOKEN]):
+          logger.error("SCANNER_IP, PAPERLESS_URL oder PAPERLESS_TOKEN nicht gesetzt!")
+          raise ValueError("Alle Umgebungsvariablen müssen gesetzt sein")
+      
+      TEMP_DIR.mkdir(parents=True, exist_ok=True)
+      
+      SCAN_SETTINGS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+      <scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+      <pwg:Version>2.1</pwg:Version><scan:Intent>Document</scan:Intent>
+      <pwg:ScanRegions><pwg:ScanRegion><pwg:Height>3507</pwg:Height><pwg:Width>2481</pwg:Width><pwg:XOffset>0</pwg:XOffset><pwg:YOffset>0</pwg:YOffset></pwg:ScanRegion></pwg:ScanRegions>
+      <pwg:InputSource>Platen</pwg:InputSource><scan:DocumentFormatExt>application/pdf</scan:DocumentFormatExt>
+      <scan:XResolution>300</scan:XResolution><scan:YResolution>300</scan:YResolution><scan:ColorMode>RGB24</scan:ColorMode>
+      <scan:CompressionFactor>25</scan:CompressionFactor><scan:Brightness>1000</scan:Brightness><scan:Contrast>1000</scan:Contrast>
+      </scan:ScanSettings>"""
+      
+      def create_scan_job():
+          headers = {"Content-Type": "text/xml", "User-Agent": "HP-Scan-Bridge/1.0"}
+          url = f"http://{SCANNER_IP}/eSCL/ScanJobs"
+          logger.info(f"Erstelle Scan-Job auf {url}")
+          try:
+              response = requests.post(url, data=SCAN_SETTINGS_XML, headers=headers, timeout=10)
+              response.raise_for_status()
+              job_url = response.headers.get("Location")
+              if not job_url:
+                  raise ValueError("Keine Job-URL in Response erhalten")
+              logger.info(f"Scan-Job erstellt: {job_url}")
+              return job_url
+          except requests.exceptions.RequestException as e:
+              logger.error(f"Fehler beim Erstellen des Scan-Jobs: {e}")
+              raise
+      
+      def download_scan(job_url, max_retries=3, wait_time=15):
+          # HIER DIE KORRIGIERTE ZEILE VON VORHIN:
+          download_url = f"{job_url}/NextDocument"
+          temp_file = TEMP_DIR / f"scan_{int(time.time())}.pdf"
+          logger.info(f"Warte {wait_time}s auf Scan-Fertigstellung...")
+          time.sleep(wait_time)
+          for attempt in range(max_retries):
+              try:
+                  logger.info(f"Download-Versuch {attempt + 1}/{max_retries}: {download_url}")
+                  response = requests.get(download_url, timeout=45, stream=True)
+                  response.raise_for_status()
+                  with open(temp_file, "wb") as f:
+                      for chunk in response.iter_content(chunk_size=8192):
+                          f.write(chunk)
+                  file_size = temp_file.stat().st_size
+                  logger.info(f"Scan heruntergeladen: {temp_file} ({file_size} bytes)")
+                  return temp_file
+              except requests.exceptions.RequestException as e:
+                  logger.warning(f"Download-Versuch {attempt + 1} fehlgeschlagen: {e}")
+                  if attempt < max_retries - 1:
+                      time.sleep(5)
+                  else:
+                      raise
+          raise Exception("Download nach allen Versuchen fehlgeschlagen")
+      
+      def upload_to_paperless(file_path):
+          timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+          title = f"Scan_{timestamp}"
+          url = f"{PAPERLESS_URL}/api/documents/post_document/"
+          headers = {"Authorization": f"Token {PAPERLESS_TOKEN}"}
+          logger.info(f"Lade Dokument zu Paperless hoch: {title}")
+          try:
+              with open(file_path, "rb") as f:
+                  files = {"document": (f"{title}.pdf", f, "application/pdf")}
+                  response = requests.post(url, headers=headers, files=files, timeout=120)
+                  response.raise_for_status()
+              logger.info(f"Upload erfolgreich: {title}")
+              return title
+          except requests.exceptions.RequestException as e:
+              logger.error(f"Upload zu Paperless fehlgeschlagen: {e}")
+              raise
+          finally:
+              if file_path.exists():
+                  file_path.unlink()
+                  logger.debug(f"Temporäre Datei gelöscht: {file_path}")
+      
+      def run_full_scan_workflow():
+          logger.info("=== Starte Scan-Workflow ===")
+          try:
+              job_url = create_scan_job()
+              temp_file = download_scan(job_url)
+              title = upload_to_paperless(temp_file)
+              logger.info(f"=== Scan-Workflow erfolgreich: {title} ===")
+              return {"success": True, "title": title}
+          except Exception as e:
+              logger.error(f"=== Scan-Workflow fehlgeschlagen: {e} ===")
+              raise
+      
+      @app.route("/health", methods=["GET"])
+      def health_check():
+          return jsonify({"status": "healthy", "scanner_ip": SCANNER_IP, "paperless_url": PAPERLESS_URL, "timestamp": datetime.datetime.now().isoformat()}), 200
+      
+      @app.route("/start_scan", methods=["POST"])
+      def start_scan_endpoint():
+          try:
+              result = run_full_scan_workflow()
+              title = result["title"]
+              return jsonify({"status": "success", "message": f"Dokument erfolgreich gescannt: {title}", "document": title}), 200
+          except Exception as e:
+              logger.exception("Fehler im Scan-Endpoint")
+              return jsonify({"status": "error", "message": str(e)}), 500
+      
+      @app.route("/config", methods=["GET"])
+      def get_config():
+          return jsonify({"scanner_ip": SCANNER_IP, "paperless_url": PAPERLESS_URL, "temp_dir": str(TEMP_DIR), "token_set": bool(PAPERLESS_TOKEN)}), 200
+      
+      if __name__ == "__main__":
+          logger.info("Starte HP Scan Bridge Server...")
+          logger.info(f"Scanner IP: {SCANNER_IP}")
+          logger.info(f"Paperless URL: {PAPERLESS_URL}")
+          app.run(host="0.0.0.0", port=5000, debug=False)
+      PYEOF
+      
+      python /app/scan_bridge.py
+      '
+    ports:
+      - "5000:5000"
+    networks:
+      - scan_network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+networks:
+  scan_network:
+    driver: bridge
